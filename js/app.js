@@ -47,8 +47,11 @@
     setTimeout(() => { t.style.opacity = '0'; t.style.transition = '.3s'; setTimeout(() => t.remove(), 300); }, 2800);
   }
   const modalRoot = $('#modalRoot');
-  function openModal({ title, body, foot = '', wide = false, onMount }) {
-    modalRoot.innerHTML = `<div class="modal ${wide ? 'wide' : ''}" role="dialog" aria-modal="true" aria-label="${esc(title)}">
+  let modalCleanup = null;
+  function openModal({ title, body, foot = '', wide = false, onMount, onClose }) {
+    if (modalCleanup) { const c = modalCleanup; modalCleanup = null; c(); }
+    modalCleanup = onClose || null;
+    modalRoot.innerHTML = `<div class="modal ${wide === 'xl' ? 'wide xl' : wide ? 'wide' : ''}" role="dialog" aria-modal="true" aria-label="${esc(title)}">
       <div class="modal-head"><h3>${esc(title)}</h3><button class="icon-btn" data-close aria-label="Close">${icon('x')}</button></div>
       <div class="modal-body">${body}</div>${foot ? `<div class="modal-foot">${foot}</div>` : ''}</div>`;
     modalRoot.classList.add('show');
@@ -56,7 +59,10 @@
     onMount && onMount(modalRoot);
     const f = modalRoot.querySelector('input, select, textarea'); f && f.focus();
   }
-  function closeModal() { modalRoot.classList.remove('show'); modalRoot.innerHTML = ''; }
+  function closeModal() {
+    if (modalCleanup) { const c = modalCleanup; modalCleanup = null; c(); }
+    modalRoot.classList.remove('show'); modalRoot.innerHTML = '';
+  }
   modalRoot.addEventListener('mousedown', (e) => { if (e.target === modalRoot) closeModal(); });
   document.addEventListener('keydown', (e) => { if (e.key === 'Escape') closeModal(); });
   document.addEventListener('click', (e) => { if (!e.target.closest('.menu-wrap')) $$('.dropdown').forEach((d) => d.classList.remove('show')); });
@@ -69,6 +75,7 @@
     });
   }
   const go = (path) => { location.hash = '#/' + path; };
+  const routeParams = () => new URLSearchParams(location.hash.split('?')[1] || '');
   const pageHead = (title, sub = '', back = '', right = '', crumbs = '') => `
     ${crumbs ? `<div class="crumbs">${crumbs}</div>` : ''}
     <div class="page-head">
@@ -112,8 +119,127 @@
   function closePopMenu() { $$('.pop-menu').forEach((m) => m.remove()); }
   window.addEventListener('scroll', closePopMenu, true);
   window.addEventListener('hashchange', closePopMenu);
-  const classOpts = (sel) => Array.from({ length: 7 }, (_, i) => `Class ${i + 6}`).map((c) => `<option ${c === sel ? 'selected' : ''}>${c}</option>`).join('');
-  const subjOpts = (sel) => DB.subjects.map((s) => `<option ${s === sel ? 'selected' : ''}>${s}</option>`).join('');
+  /* ---------- Academic data: one catalog (js/catalog.js), persisted + migrated ---------- */
+  const YEAR_LABELS = ['2025 – 2026', '2026 – 2027', '2027 – 2028'];
+  const DEFAULT_SCORM_SETTINGS = { trackCompletion: true, syncScore: true, allowReattempts: true, openInNewWindow: false };
+  const catalogCtx = () => ({ subjects: DB.subjects, classRows: DB.classes, academicYears: DB.academicYears, currentYearId: Catalog.yearIdFromLabel(DB.academicYear) });
+  function persist() {
+    Store.save({ version: 2, classes: DB.classes, materials: DB.materials, subjects: DB.subjects, sections: DB.sections, academicYear: DB.academicYear, scormSettings: DB.scormSettings });
+  }
+  (function bootstrapData() {
+    const saved = Store.load();
+    if (saved) ['classes', 'materials', 'subjects', 'sections', 'academicYear'].forEach((k) => { if (saved[k]) DB[k] = saved[k]; });
+    DB.academicYears = YEAR_LABELS.map((label) => ({ id: Catalog.yearIdFromLabel(label), label }));
+    // Every migration below is idempotent, so it runs on each load.
+    DB.classes = Catalog.migrateClassRows(DB.classes);
+    DB.subjects = Catalog.migrateSubjects(DB.subjects);
+    DB.scormSettings = { ...DEFAULT_SCORM_SETTINGS, ...(saved?.scormSettings || {}) };
+    DB.materials = DB.materials.map((m, i) => {
+      const out = Catalog.migrateMaterial(m, catalogCtx(), i);
+      if (out.type === 'SCORM' && !out.tracking) out.tracking = { trackCompletion: DB.scormSettings.trackCompletion, syncScore: DB.scormSettings.syncScore };
+      return out;
+    });
+    persist();
+  })();
+  const uid = (p) => `${p}-${(crypto.randomUUID ? crypto.randomUUID() : Date.now().toString(36) + Math.random().toString(36).slice(2)).slice(0, 13)}`;
+  const describe = (m) => Catalog.describeAudience(catalogCtx(), m.audience);
+
+  // Class pickers everywhere come from the same Classes 1–12 catalog.
+  const classOpts = (sel) => Catalog.CLASSES.map((c) => `<option ${c.name === sel ? 'selected' : ''}>${c.name}</option>`).join('');
+  const subjOpts = (sel) => DB.subjects.map((s) => `<option ${s.name === sel ? 'selected' : ''}>${esc(s.name)}</option>`).join('');
+  const classIdOpts = (sel) => Catalog.STAGES.map((st) => `<optgroup label="${st.name}">${Catalog.CLASSES.filter((c) => c.stageId === st.id)
+    .map((c) => `<option value="${c.id}" ${c.id === sel ? 'selected' : ''}>${c.name}</option>`).join('')}</optgroup>`).join('');
+
+  /* Accessible field helpers: visible label bound to control, help text + error via aria-describedby. */
+  const errId = (id) => `${id}-err`;
+  const errSlot = (id) => `<p class="field-error" id="${errId(id)}" aria-live="polite"></p>`;
+  function setFieldError(root, id, msg) {
+    const ctl = root.querySelector('#' + id), slot = root.querySelector('#' + errId(id));
+    if (slot) slot.textContent = msg || '';
+    if (ctl) { if (msg) ctl.setAttribute('aria-invalid', 'true'); else ctl.removeAttribute('aria-invalid'); }
+  }
+  const switchRow = (id, label, help, checked, name = '') => `<div class="toggle-row"><div class="meta"><label for="${id}"><strong>${label}</strong></label>${help ? `<small id="${id}-help">${help}</small>` : ''}</div>
+    <span class="switch"><input type="checkbox" role="switch" id="${id}" ${name ? `name="${name}"` : ''} ${help ? `aria-describedby="${id}-help"` : ''} ${checked ? 'checked' : ''} /><span aria-hidden="true"></span></span></div>`;
+
+  /* Audience fields (school, year, class, stream, sections, subject) shared by Upload and Edit Material. */
+  function audienceFields(p, a) {
+    return `<div class="field full ctx-line"><span>School</span><strong>${esc(Catalog.SCHOOL.name)}</strong></div>
+      <div class="field"><label for="${p}-year">Academic year <span class="req" aria-hidden="true">*</span></label>
+        <select class="select" id="${p}-year" aria-required="true" aria-describedby="${errId(p + '-year')}">${DB.academicYears.map((y) => `<option value="${y.id}" ${y.id === a.academicYearId ? 'selected' : ''}>${y.label}</option>`).join('')}</select>${errSlot(p + '-year')}</div>
+      <div class="field"><label for="${p}-class">Class <span class="req" aria-hidden="true">*</span></label>
+        <select class="select" id="${p}-class" name="classId" aria-required="true" aria-describedby="${errId(p + '-class')}">${classIdOpts(a.classId)}</select>${errSlot(p + '-class')}</div>
+      <div class="field" id="${p}-stream-wrap"><label for="${p}-stream">Stream</label>
+        <select class="select" id="${p}-stream" name="streamId" aria-describedby="${p}-stream-help ${errId(p + '-stream')}"></select>
+        <span class="hint" id="${p}-stream-help">Classes 11–12 only. “All streams” targets every stream.</span>${errSlot(p + '-stream')}</div>
+      <div class="field"><label for="${p}-subject">Subject <span class="req" aria-hidden="true">*</span></label>
+        <select class="select" id="${p}-subject" name="subjectId" aria-required="true" aria-describedby="${p}-subject-help ${errId(p + '-subject')}"></select>
+        <span class="hint" id="${p}-subject-help">Only subjects offered for the selected class are listed.</span>${errSlot(p + '-subject')}</div>
+      <fieldset class="field full fieldset" id="${p}-sections" aria-describedby="${p}-sections-help ${errId(p + '-sections')}">
+        <legend>Sections</legend><div class="check-list" id="${p}-sections-list"></div>
+        <span class="hint" id="${p}-sections-help">Leave all unchecked to target every section of the class.</span>${errSlot(p + '-sections')}</fieldset>`;
+  }
+  function bindAudience(root, p, a) {
+    const q = (s) => root.querySelector(s);
+    const cls = q(`#${p}-class`), stream = q(`#${p}-stream`), subj = q(`#${p}-subject`);
+    let sectionIds = [...(a.sectionIds || [])];
+    const refresh = () => {
+      const classId = cls.value, c = Catalog.classById(classId);
+      const streams = Catalog.streamsFor(classId);
+      const keepStream = streams.some((s) => s.id === stream.value) ? stream.value : (streams.some((s) => s.id === a.streamId) ? a.streamId : '');
+      stream.innerHTML = `<option value="">All streams</option>` + streams.map((s) => `<option value="${s.id}" ${s.id === keepStream ? 'selected' : ''}>${s.name}</option>`).join('');
+      q(`#${p}-stream-wrap`).hidden = !streams.length;   // Stream is only shown (and only sent) where it applies.
+      const offered = Catalog.subjectsFor(DB.subjects, classId, stream.value || null);
+      const keepSubj = offered.some((s) => s.id === subj.value) ? subj.value : (offered.some((s) => s.id === a.subjectId) ? a.subjectId : '');
+      subj.innerHTML = `<option value="">Select a subject</option>` + offered.map((s) => `<option value="${s.id}" ${s.id === keepSubj ? 'selected' : ''}>${esc(s.name)}</option>`).join('');
+      const secs = Catalog.sectionsFor(DB.classes, classId);
+      sectionIds = sectionIds.filter((id) => secs.some((s) => s.id === id));
+      q(`#${p}-sections-list`).innerHTML = secs.length
+        ? secs.map((s) => `<label class="check"><input type="checkbox" value="${s.id}" ${sectionIds.includes(s.id) ? 'checked' : ''} /> Section ${esc(s.section)}</label>`).join('')
+        : `<p class="muted" style="margin:0">No sections are configured for ${c ? c.name : 'this class'} yet — the material will reach every section added later.</p>`;
+      $$('input', q(`#${p}-sections-list`)).forEach((i) => (i.onchange = () => { sectionIds = $$('input:checked', q(`#${p}-sections-list`)).map((x) => x.value); }));
+    };
+    cls.addEventListener('change', refresh);
+    stream.addEventListener('change', refresh);
+    refresh();
+    return {
+      read: () => {
+        const streams = Catalog.streamsFor(cls.value);
+        return { schoolId: Catalog.SCHOOL.id, academicYearId: q(`#${p}-year`).value, classId: cls.value, sectionIds: [...sectionIds],
+          streamId: streams.length && stream.value ? stream.value : null, subjectId: subj.value };
+      },
+      showErrors: (errors) => {
+        const map = { academicYear: `${p}-year`, class: `${p}-class`, stream: `${p}-stream`, subject: `${p}-subject`, sections: `${p}-sections` };
+        Object.values(map).forEach((id) => setFieldError(root, id, ''));
+        errors.forEach((e) => map[e.field] && setFieldError(root, map[e.field], e.message));
+        const first = errors.map((e) => map[e.field]).find(Boolean);
+        return first ? root.querySelector(first === `${p}-sections` ? `#${p}-sections input, #${p}-class` : '#' + first) : null;
+      },
+    };
+  }
+
+  /* SCORM package status, shared by Upload, Edit and Preview. */
+  function packageState(m) {
+    if (m.type !== 'SCORM') return null;
+    if (!m.package || m.package.status === 'missing') return { kind: 'unavailable', label: 'Package file unavailable' };
+    return m.package.status === 'ready' ? { kind: 'ready', label: 'Ready' } : { kind: 'invalid', label: 'Invalid package' };
+  }
+  function packageReportHtml(r, file) {
+    if (!r) return '';
+    const items = [...r.errors.map((e) => `<li class="err">${esc(e.message)}</li>`), ...r.warnings.map((w) => `<li class="warn">${esc(w)}</li>`)];
+    return `<div class="pkg-report ${r.ok ? 'ok' : 'bad'}">
+      <strong>${r.ok ? `${icon('check')} Valid ${esc(r.versionLabel)} package` : `${icon('alert')} This package cannot be used`}</strong>
+      ${r.ok ? `<small>Launch file: <code>${esc(r.launchPath)}</code> · ${r.scoCount} SCO${r.scoCount === 1 ? '' : 's'} · ${r.fileCount} files${file ? ` · ${esc(file.name)}` : ''}</small>` : ''}
+      ${items.length ? `<ul>${items.join('')}</ul>` : ''}</div>`;
+  }
+  const packageMeta = (r, file, id) => ({ id, fileName: file.name, size: file.size, uploadedAt: new Date().toISOString(), status: r.status,
+    version: r.version, versionLabel: r.versionLabel, launchPath: r.launchPath, scoCount: r.scoCount, fileCount: r.fileCount,
+    title: r.title, errors: r.errors, warnings: r.warnings });
+  const canPublish = (m) => {
+    const errs = Catalog.validateAudience(catalogCtx(), m.audience);
+    if (errs.length) return errs[0].message;
+    if (m.type === 'SCORM' && packageState(m).kind !== 'ready') return 'Attach a valid SCORM package before publishing (Edit → Replace package).';
+    return '';
+  };
 
   /* ---------- State ---------- */
   const state = {
@@ -363,7 +489,7 @@
      ========================================================== */
   const ACADEMIC = [
     { key: 'year', ic: 'calendar', img: 'acYear', c: 't-purple', t: 'Academic Year', s: `(${DB.academicYear})` },
-    { key: 'classes', ic: 'layers', img: 'acClasses', c: 't-blue', t: 'Classes', s: '(Class 6 – 12)', count: () => DB.classes.length },
+    { key: 'classes', ic: 'layers', img: 'acClasses', c: 't-blue', t: 'Classes', s: `(${Catalog.CLASSES[0].name} – ${Catalog.CLASSES[Catalog.CLASSES.length - 1].grade})`, count: () => DB.classes.length },
     { key: 'subjects', ic: 'book', img: 'acSubjects', c: 't-orange', t: 'Subjects', s: '(Physics, Chemistry…)', count: () => DB.subjects.length },
     { key: 'sections', ic: 'sitemap', img: 'acSections', c: 't-blue', t: 'Sections', s: '(A, B, C…)', count: () => DB.sections.length },
     { key: 'syllabus', ic: 'syllabus', img: 'acSyllabus', c: 't-blue', t: 'Syllabus', s: '(Chapter & Units)' },
@@ -397,13 +523,28 @@
         foot: `<button class="btn btn-outline" data-close>Cancel</button><button class="btn btn-primary" id="saveAy">Save</button>`,
         onMount: (r) => ($('#saveAy', r).onclick = () => { DB.academicYear = $('#ay', r).value; ACADEMIC[0].s = `(${DB.academicYear})`; closeModal(); render(); toast('Academic year updated'); }) });
     } else if (k === 'subjects' || k === 'sections') {
-      const arr = k === 'subjects' ? DB.subjects : DB.sections;
-      const title = k === 'subjects' ? 'Subjects' : 'Sections';
+      const subjects = k === 'subjects';
+      const arr = subjects ? DB.subjects : DB.sections;
+      const title = subjects ? 'Subjects' : 'Sections';
+      const nameOf = (s) => (subjects ? s.name : s);
+      const scope = (s) => {
+        const streams = s.streamIds ? s.streamIds.map((id) => Catalog.streamById(id)?.name).join(', ') : 'all streams';
+        return `Class ${s.minGrade}–${s.maxGrade}${s.maxGrade >= 11 ? ` · ${streams} (Class 11–12)` : ''}`;
+      };
+      const inUse = (s) => (subjects ? DB.materials.filter((m) => m.audience?.subjectId === s.id).length : 0);
       const draw = (r) => {
-        $('.modal-body', r).innerHTML = list(arr.map((s, i) => `<span class="tile-ico t-blue" style="width:34px;height:34px">${icon(k === 'subjects' ? 'book' : 'sitemap')}</span><div class="meta"><strong>${esc(s)}</strong></div><button class="act btn-ghost icon-btn" data-rm="${i}" title="Remove">${icon('trash')}</button>`),
-          `<form id="addItem" style="display:flex;gap:10px;margin-top:14px"><input class="input" name="v" placeholder="Add ${title.toLowerCase().slice(0, -1)}…" required /><button class="btn btn-primary">${icon('plus')}Add</button></form>`);
-        $$('[data-rm]', r).forEach((b) => (b.onclick = () => { arr.splice(+b.dataset.rm, 1); draw(r); render(); }));
-        $('#addItem', r).onsubmit = (e) => { e.preventDefault(); const v = e.target.v.value.trim(); if (v) { arr.push(v); draw(r); render(); toast(`${v} added`); $('#addItem input', r).focus(); } };
+        $('.modal-body', r).innerHTML = list(arr.map((s, i) => `<span class="tile-ico t-blue" style="width:34px;height:34px">${icon(subjects ? 'book' : 'sitemap')}</span><div class="meta"><strong>${esc(nameOf(s))}</strong>${subjects ? `<small>${scope(s)}</small>` : ''}</div><button class="act btn-ghost icon-btn" data-rm="${i}" title="Remove ${esc(nameOf(s))}" aria-label="Remove ${esc(nameOf(s))}">${icon('trash')}</button>`),
+          `<form id="addItem" style="display:flex;gap:10px;margin-top:14px"><label class="sr-only" for="addItemInput">New ${title.toLowerCase().slice(0, -1)}</label><input class="input" id="addItemInput" name="v" placeholder="Add ${title.toLowerCase().slice(0, -1)}…" required /><button class="btn btn-primary">${icon('plus')}Add</button></form>`);
+        $$('[data-rm]', r).forEach((b) => (b.onclick = () => {
+          const s = arr[+b.dataset.rm], n = inUse(s);
+          if (n) return toast(`${nameOf(s)} is used by ${n} material(s). Retarget them before removing it.`, true);
+          arr.splice(+b.dataset.rm, 1); draw(r); render();
+        }));
+        $('#addItem', r).onsubmit = (e) => {
+          e.preventDefault(); const v = e.target.v.value.trim(); if (!v) return;
+          if (arr.some((s) => nameOf(s).toLowerCase() === v.toLowerCase())) return toast(`${v} already exists`, true);
+          arr.push(subjects ? Catalog.makeSubject(v) : v); draw(r); render(); toast(`${v} added`); $('#addItem input', r).focus();
+        };
       };
       openModal({ title, body: '', foot: '<button class="btn btn-primary" data-close>Done</button>', onMount: draw });
     } else if (k === 'syllabus') {
@@ -420,16 +561,23 @@
       `<a class="btn btn-primary" href="#/academic/create-class">${icon('plus')}Create Class</a>`)}
     <div class="card"><div class="table-wrap"><table class="tbl stack">
       <thead><tr><th>Class</th><th>Section</th><th>Class Teacher</th><th>Subjects</th><th>Students</th><th>Actions</th></tr></thead>
-      <tbody>${DB.classes.map((c, i) => `<tr>
+      <tbody>${Catalog.CLASSES.map((g) => {
+        const rows = DB.classes.filter((c) => c.classId === g.id);
+        if (!rows.length) return `<tr class="empty-class"><td class="name">${g.name}</td><td colspan="4" class="muted">No sections configured yet</td>
+          <td><div class="actions"><a class="btn btn-outline btn-sm" href="#/academic/create-class?cls=${g.grade}">${icon('plus')}Add section</a></div></td></tr>`;
+        return rows.map((c) => { const i = DB.classes.indexOf(c); return `<tr>
         <td class="name">${c.name}</td><td>${c.section}</td><td>${esc(c.teacher)}</td>
-        <td>${c.subjects.slice(0, 3).map((s) => `<span class="chip" style="margin-right:4px;padding:3px 9px">${s}</span>`).join('')}${c.subjects.length > 3 ? `<span class="muted">+${c.subjects.length - 3}</span>` : ''}</td>
+        <td>${c.subjects.slice(0, 3).map((s) => `<span class="chip" style="margin-right:4px;padding:3px 9px">${esc(s)}</span>`).join('')}${c.subjects.length > 3 ? `<span class="muted">+${c.subjects.length - 3}</span>` : ''}</td>
         <td>${c.students}</td>
-        <td><div class="actions"><button class="act del" data-delclass="${i}" title="Delete">${icon('trash')}</button></div></td></tr>`).join('')}
+        <td><div class="actions"><button class="act del" data-delclass="${i}" title="Delete" aria-label="Delete ${c.name} – ${c.section}">${icon('trash')}</button></div></td></tr>`; }).join('');
+      }).join('')}
       </tbody></table></div></div>`;
   }
   function bindClasses() {
     $$('[data-delclass]').forEach((b) => (b.onclick = () => {
       const c = DB.classes[+b.dataset.delclass];
+      const used = DB.materials.filter((m) => m.audience?.sectionIds?.includes(c.id)).length;
+      if (used) return toast(`${c.name} – ${c.section} is targeted by ${used} material(s). Retarget them before deleting the section.`, true);
       confirmDialog('Delete class', `Delete <strong>${c.name} – ${c.section}</strong>?`, () => { DB.classes.splice(+b.dataset.delclass, 1); render(); toast('Class deleted'); });
     }));
   }
@@ -441,14 +589,14 @@
     <div class="split">
       <form class="card card-pad" id="classForm" novalidate>
         <div class="form-grid">
-          <div class="field"><label>Class Name <span class="req">*</span></label><select class="select" name="cls">${classOpts('Class 12')}</select></div>
-          <div class="field"><label>Section <span class="req">*</span></label><select class="select" name="section">${DB.sections.map((s) => `<option>${s}</option>`).join('')}</select></div>
-          <div class="field full"><label>Class Teacher</label><select class="select" name="teacher">${DB.teacherNames.map((t) => `<option>${t}</option>`).join('')}</select></div>
-          <div class="field full"><label>Subjects</label>
-            <div class="chips-input" id="chips"></div>
-            <span class="hint">Pick subjects from the dropdown; click × to remove.</span></div>
-          <div class="field"><label>Room No.</label><input class="input" name="room" placeholder="e.g. B-204" /></div>
-          <div class="field"><label>Max Students</label><input class="input" type="number" name="max" value="40" min="1" /></div>
+          <div class="field"><label for="cc-class">Class Name <span class="req" aria-hidden="true">*</span></label><select class="select" id="cc-class" name="cls">${classOpts(`Class ${routeParams().get('cls') || 12}`)}</select></div>
+          <div class="field"><label for="cc-section">Section <span class="req" aria-hidden="true">*</span></label><select class="select" id="cc-section" name="section">${DB.sections.map((s) => `<option>${esc(s)}</option>`).join('')}</select></div>
+          <div class="field full"><label for="cc-teacher">Class Teacher</label><select class="select" id="cc-teacher" name="teacher">${DB.teacherNames.map((t) => `<option>${t}</option>`).join('')}</select></div>
+          <div class="field full"><span class="label" id="cc-subjects-label">Subjects</span>
+            <div class="chips-input" id="chips" role="group" aria-labelledby="cc-subjects-label" aria-describedby="cc-subjects-help"></div>
+            <span class="hint" id="cc-subjects-help">Subjects offered for the selected class. Pick from the dropdown; click × to remove.</span></div>
+          <div class="field"><label for="cc-room">Room No.</label><input class="input" id="cc-room" name="room" placeholder="e.g. B-204" /></div>
+          <div class="field"><label for="cc-max">Max Students</label><input class="input" type="number" id="cc-max" name="max" value="40" min="1" /></div>
         </div>
         <div class="form-actions">
           <a class="btn btn-outline" href="#/academic/classes">Cancel</a>
@@ -468,9 +616,11 @@
   }
   function bindCreateClass() {
     const form = $('#classForm');
-    let subjects = ['Physics', 'Chemistry', 'Mathematics'];
+    const offered = () => Catalog.subjectsFor(DB.subjects, Catalog.classIdFromName(form.cls.value), null).map((s) => s.name);
+    let subjects = offered().slice(0, 3);
+    form.cls.addEventListener('change', () => { const o = offered(); subjects = subjects.filter((s) => o.includes(s)); if (!subjects.length) subjects = o.slice(0, 3); drawChips(); });
     const drawChips = () => {
-      const remaining = DB.subjects.filter((s) => !subjects.includes(s));
+      const remaining = offered().filter((s) => !subjects.includes(s));
       $('#chips').innerHTML = subjects.map((s) => `<span class="chip">${s}<button type="button" data-rm="${s}" aria-label="Remove ${s}">${icon('x')}</button></span>`).join('') +
         (remaining.length ? `<select id="addSubj" aria-label="Add subject"><option value="">+ Add subject</option>${remaining.map((s) => `<option>${s}</option>`).join('')}</select>` : '');
       $$('[data-rm]', $('#chips')).forEach((b) => (b.onclick = () => { subjects = subjects.filter((x) => x !== b.dataset.rm); drawChips(); }));
@@ -492,7 +642,7 @@
       const d = Object.fromEntries(new FormData(form));
       if (!subjects.length) return toast('Add at least one subject', true);
       if (DB.classes.some((c) => c.name === d.cls && c.section === d.section)) return toast(`${d.cls} – ${d.section} already exists`, true);
-      DB.classes.push({ name: d.cls, section: d.section, teacher: d.teacher, subjects: [...subjects], students: 0 });
+      DB.classes.push(...Catalog.migrateClassRows([{ name: d.cls, section: d.section, teacher: d.teacher, subjects: [...subjects], students: 0 }]));
       toast(`${d.cls} – ${d.section} created`);
       go('academic/classes');
     };
@@ -522,11 +672,11 @@
   }
   function renderContentRows() {
     const st = state.content, q = st.q.toLowerCase();
-    const rows = DB.materials.filter((m) => (st.tab === 'All Materials' || m.type === st.tab) && (!q || (m.title + m.subject + m.cls).toLowerCase().includes(q)));
+    const rows = DB.materials.filter((m) => { const d = describe(m); return (st.tab === 'All Materials' || m.type === st.tab) && (!q || (m.title + d.subject + d.cls + d.detail).toLowerCase().includes(q)); });
     $('#contentRows').innerHTML = rows.length ? rows.map((m) => {
-      const i = DB.materials.indexOf(m);
+      const i = DB.materials.indexOf(m), d = describe(m);
       return `<tr><td><input type="checkbox" class="img-check" aria-label="Select ${esc(m.title)}" /></td>
-        <td class="name">${esc(m.title)}</td><td>${typeChip(m.type)}</td><td>${m.cls}</td><td>${m.subject}</td><td>${contentStatus(m.status)}</td>
+        <td class="name">${esc(m.title)}</td><td>${typeChip(m.type)}</td><td>${d.cls}<small class="aud-detail">${esc(d.detail)}</small></td><td>${esc(d.subject)}</td><td>${contentStatus(m.status)}</td>
         <td><div class="actions">
           <button class="act img-act" data-mview="${i}" title="Preview" aria-label="Preview">${img('clView')}</button>
           <button class="act img-act" data-medit="${i}" title="Edit" aria-label="Edit">${img('clEdit')}</button>
@@ -550,25 +700,32 @@
           $('#bulkList', r).innerHTML = files.map((f) => `<div class="file-row">${icon('file')}<div class="meta"><strong>${esc(f.name)}</strong><small>${(f.size / 1048576).toFixed(1)} MB</small></div></div>`).join('');
           $('#bulkGo', r).disabled = !files.length;
         };
-        $('#bulkGo', r).onclick = () => {
-          files.forEach((f) => {
+        $('#bulkGo', r).onclick = async () => {
+          $('#bulkGo', r).disabled = true;
+          let invalid = 0;
+          for (const f of files) {
             const ext = f.name.split('.').pop().toLowerCase();
             const type = ext === 'pdf' ? 'PDF' : ['mp4', 'mov', 'webm'].includes(ext) ? 'Video' : ext === 'zip' ? 'SCORM' : 'Document';
-            DB.materials.unshift({ title: f.name.replace(/\.[^.]+$/, ''), type, cls: 'Class 12', subject: 'Physics', status: 'Draft' });
-          });
-          closeModal(); render(); toast(`${files.length} file(s) uploaded as Draft`);
+            const m = { id: uid('mat'), title: f.name.replace(/\.[^.]+$/, ''), type, status: 'Draft',
+              audience: { schoolId: Catalog.SCHOOL.id, academicYearId: Catalog.yearIdFromLabel(DB.academicYear), classId: 'class-12', sectionIds: [], streamId: null, subjectId: Catalog.subjectIdFor('Physics') } };
+            if (type === 'SCORM') {
+              const rep = await Scorm.inspectPackage(await f.arrayBuffer());
+              const pid = uid('pkg');
+              if (rep.ok) await Store.putPackage(pid, f); else invalid++;
+              m.package = packageMeta(rep, f, rep.ok ? pid : null);
+              m.tracking = { trackCompletion: DB.scormSettings.trackCompletion, syncScore: DB.scormSettings.syncScore };
+            }
+            DB.materials.unshift(m);
+          }
+          closeModal(); render();
+          toast(`${files.length} file(s) uploaded as Draft${invalid ? ` · ${invalid} SCORM package(s) failed validation — open Preview for details` : ''}`, !!invalid);
         };
       },
     });
     $('#contentRows').onclick = (e) => {
       const b = e.target.closest('button'); if (!b) return;
       if (b.dataset.mview) {
-        const m = DB.materials[+b.dataset.mview];
-        openModal({ title: m.title, body: `<div style="display:flex;gap:14px;align-items:center;margin-bottom:10px">${typeChip(m.type)}${contentStatus(m.status)}</div>
-          <div class="toggle-row"><div class="meta"><small>Class</small><strong>${m.cls}</strong></div></div>
-          <div class="toggle-row"><div class="meta"><small>Subject</small><strong>${m.subject}</strong></div></div>
-          <div class="toggle-row"><div class="meta"><small>Views</small><strong>${fmt(120 + m.title.length * 23)}</strong></div></div>`,
-          foot: '<button class="btn btn-outline" data-close>Close</button>' });
+        previewModal(DB.materials[+b.dataset.mview]);
       } else if (b.dataset.medit) {
         materialModal(DB.materials[+b.dataset.medit]);
       } else if (b.dataset.mmore) {
@@ -576,62 +733,231 @@
         const i = +b.dataset.mmore, m = DB.materials[i];
         const pub = m.status === 'Published';
         popMenu(b, [
-          { icon: pub ? 'archive' : 'check', label: pub ? 'Unpublish (Draft)' : 'Publish', run: () => { m.status = pub ? 'Draft' : 'Published'; renderContentRows(); toast(`${m.title} → ${m.status}`); } },
-          { icon: 'trash', label: 'Delete', danger: true, run: () => confirmDialog('Delete material', `Delete <strong>${esc(m.title)}</strong>?`, () => { DB.materials.splice(i, 1); render(); toast('Material deleted'); }) },
+          { icon: pub ? 'archive' : 'check', label: pub ? 'Unpublish (Draft)' : 'Publish', run: () => {
+            if (!pub) { const why = canPublish(m); if (why) return toast(why, true); }
+            m.status = pub ? 'Draft' : 'Published'; persist(); renderContentRows(); toast(`${m.title} → ${m.status}`);
+          } },
+          { icon: 'trash', label: 'Delete', danger: true, run: () => confirmDialog('Delete material', `Delete <strong>${esc(m.title)}</strong>?`, () => {
+            if (m.package?.id) Store.deletePackage(m.package.id).catch(() => {});
+            DB.materials.splice(i, 1); render(); toast('Material deleted');
+          }) },
         ]);
       }
     };
   }
-  function materialModal(m) {
+
+  /* ---------- Material preview (metadata + SCORM package status + staff test launch) ---------- */
+  const kv = (label, value) => `<div class="toggle-row"><div class="meta"><small>${label}</small><strong>${value}</strong></div></div>`;
+  function previewModal(m) {
+    const d = describe(m), ps = packageState(m), p = m.package;
+    let pkg = '';
+    if (ps) {
+      const reason = ps.kind === 'ready' ? '' : ps.kind === 'unavailable'
+        ? 'This record has no package file attached (demo or legacy data). To make it playable, choose <strong>Attach package</strong> (or Edit → Replace package) and upload a SCORM 1.2 or SCORM 2004 .zip. The record, its audience and its status are kept.'
+        : 'The attached file failed validation, so it cannot be launched. Fix the issues below and use <strong>Replace package</strong> to upload a corrected .zip.';
+      pkg = `<section class="pkg-section" aria-labelledby="pkgHead">
+        <h4 id="pkgHead">SCORM package <span class="pkg-pill ${ps.kind}">${ps.label}</span></h4>
+        ${p ? `<dl class="pkg-dl"><dt>Detected version</dt><dd>${esc(p.versionLabel || 'Not detected')}</dd>
+          <dt>Launch file</dt><dd>${p.launchPath ? `<code>${esc(p.launchPath)}</code>` : '—'}</dd>
+          <dt>File</dt><dd>${esc(p.fileName)} · ${(p.size / 1048576).toFixed(2)} MB</dd>
+          <dt>Validated</dt><dd>${new Date(p.uploadedAt).toLocaleString('en-IN')}</dd></dl>` : ''}
+        ${p && (p.errors.length || p.warnings.length) ? `<ul class="pkg-issues">${p.errors.map((e) => `<li class="err">${esc(e.message)}</li>`).join('')}${p.warnings.map((w) => `<li class="warn">${esc(w)}</li>`).join('')}</ul>` : ''}
+        ${reason ? `<p class="pkg-reason" id="launchReason">${reason}</p>` : ''}
+        ${m.tracking ? `<p class="muted" style="margin:8px 0 0;font-size:12.5px">Tracking: completion ${m.tracking.trackCompletion ? 'on' : 'off'} · score sync ${m.tracking.syncScore ? 'on' : 'off'}</p>` : ''}
+      </section>`;
+    }
     openModal({
-      title: 'Edit Material',
-      body: `<form id="matForm" class="form-grid">
-        <div class="field full"><label>Title <span class="req">*</span></label><input class="input" name="title" required value="${esc(m.title)}" /></div>
-        <div class="field"><label>Type</label><select class="select" name="type">${Object.keys(TYPE).map((t) => `<option ${t === m.type ? 'selected' : ''}>${t}</option>`).join('')}</select></div>
-        <div class="field"><label>Status</label><select class="select" name="status">${['Published', 'Draft'].map((s) => `<option ${s === m.status ? 'selected' : ''}>${s}</option>`).join('')}</select></div>
-        <div class="field"><label>Class</label><select class="select" name="cls">${classOpts(m.cls)}</select></div>
-        <div class="field"><label>Subject</label><select class="select" name="subject">${subjOpts(m.subject)}</select></div></form>`,
+      title: m.title, wide: !!ps,
+      body: `<div style="display:flex;gap:14px;align-items:center;margin-bottom:10px">${typeChip(m.type)}${contentStatus(m.status)}</div>
+        ${kv('Class', `${d.cls} <span class="muted" style="font-weight:500">· ${esc(d.detail)}</span>`)}${kv('Subject', esc(d.subject))}${kv('Views', fmt(120 + m.title.length * 23))}${pkg}`,
+      foot: `<button class="btn btn-outline" data-close>Close</button>${ps && ps.kind !== 'ready' ? `<button class="btn btn-outline" id="attachPkg">${icon('upload')}${ps.kind === 'unavailable' ? 'Attach package' : 'Replace package'}</button>` : ''}
+        ${ps ? `<button class="btn btn-primary" id="launchBtn" ${ps.kind === 'ready' ? '' : 'disabled aria-describedby="launchReason"'}>${icon('play')}Launch Preview</button>` : ''}`,
+      onMount: (r) => {
+        const a = $('#attachPkg', r); if (a) a.onclick = () => materialModal(m, true);
+        const l = $('#launchBtn', r); if (l) l.onclick = () => launchPreview(m);
+      },
+    });
+  }
+
+  // Preview runs in scorm-player.html on the configured player origin. Only postMessage crosses the boundary.
+  const PLAYER_ORIGIN = (window.LU_CONFIG && window.LU_CONFIG.scormPlayerOrigin) || location.origin;
+  const previewAttempts = [];   // staff test attempts: in memory only, never stored with student records
+  async function launchPreview(m) {
+    const blob = m.package?.id ? await Store.getPackage(m.package.id).catch(() => null) : null;
+    if (!blob) {
+      if (m.package) m.package = { ...m.package, status: 'missing' };   // keep the metadata, disable launch
+      persist(); renderContentRows();
+      toast('Package file unavailable in this browser. Attach the .zip again to preview it.', true);
+      return previewModal(m);
+    }
+    const attempt = { id: uid('preview'), materialId: m.id, startedBy: 'Admin', startedAt: new Date().toISOString(), tracking: null, calls: 0 };
+    previewAttempts.push(attempt);
+    const isolated = PLAYER_ORIGIN !== location.origin;
+    const src = new URL('scorm-player.html', PLAYER_ORIGIN + '/');
+    src.searchParams.set('admin', location.origin);
+    let onMsg = null;
+    openModal({
+      title: `Preview — ${m.title}`, wide: 'xl',
+      body: `<div class="preview-note" role="note"><strong>Staff test attempt</strong> · learner “Preview, Staff” · credit: no-credit.
+          Nothing from this preview is written to student grades, completion, attempt history or enrollment.
+          ${isolated ? '' : '<br/><span class="warn-text">Isolation: the player is running on the Admin origin (development fallback). Set <code>scormPlayerOrigin</code> in js/config.js to a separate origin for production.</span>'}</div>
+        <div class="preview-grid">
+          <iframe id="playerFrame" title="SCORM package preview: ${esc(m.title)}" src="${esc(src.href)}"
+            sandbox="allow-scripts allow-same-origin allow-forms allow-popups allow-modals" allow="fullscreen; autoplay" referrerpolicy="no-referrer"></iframe>
+          <aside class="preview-track" aria-labelledby="trkHead"><h4 id="trkHead">Preview tracking</h4>
+            <dl class="pkg-dl" id="trk"><dt>Status</dt><dd id="trkState">Loading player…</dd><dt>Completion</dt><dd id="trkCompletion">—</dd>
+              <dt>Success</dt><dd id="trkSuccess">—</dd><dt>Score</dt><dd id="trkScore">—</dd></dl>
+            <p class="muted" id="trkWould" style="font-size:12px"></p>
+            <h4>Runtime calls</h4><ol class="trk-log" id="trkLog" aria-live="off"></ol></aside>
+        </div>`,
+      foot: `<span class="muted" style="margin-right:auto;font-size:12.5px">${esc(m.package.versionLabel)} · ${esc(m.package.launchPath)}</span><button class="btn btn-primary" data-close>End preview</button>`,
+      onMount: (r) => {
+        const frame = $('#playerFrame', r);
+        const setText = (id, t) => { const el = $('#' + id, r); if (el) el.textContent = t; };
+        onMsg = async (e) => {
+          if (e.origin !== new URL(PLAYER_ORIGIN).origin || e.source !== frame.contentWindow) return;
+          const d = e.data || {};
+          if (d.type === 'lu-player-ready') {
+            setText('trkState', 'Sending package…');
+            const buf = await blob.arrayBuffer();
+            frame.contentWindow.postMessage({ type: 'lu-preview-load', attemptId: attempt.id, zip: buf }, PLAYER_ORIGIN, [buf]);
+          } else if (d.attemptId !== attempt.id) {
+            return;
+          } else if (d.type === 'lu-preview-started') setText('trkState', 'Running');
+          else if (d.type === 'lu-preview-error') { setText('trkState', 'Error: ' + d.message); toast(d.message, true); }
+          else if (d.type === 'lu-runtime') {
+            attempt.calls++; attempt.tracking = d.tracking;
+            if (d.call === 'Terminate') setText('trkState', 'Finished (Terminate/LMSFinish called)');
+            const t = d.tracking;
+            setText('trkCompletion', t.completion); setText('trkSuccess', t.success);
+            setText('trkScore', t.score.percent === null ? `No score (${t.score.note})` : `${t.score.percent}% · ${t.score.note}`);
+            const would = Scorm.gradebookUpdate(t, m.tracking || DB.scormSettings);
+            setText('trkWould', `A learner attempt with these settings would record: completion ${would.completion ?? 'not tracked'}, ` +
+              `result ${would.success ?? 'not tracked'}, gradebook score ${would.scorePercent === null ? 'none' : would.scorePercent + '%'}. (Not recorded — staff preview.)`);
+            const li = document.createElement('li');
+            li.textContent = d.element ? `${d.call} ${d.element} = ${d.value}` : d.call;
+            const log = $('#trkLog', r); if (log) { log.appendChild(li); log.scrollTop = log.scrollHeight; }
+          }
+        };
+        window.addEventListener('message', onMsg);
+      },
+      onClose: () => {
+        window.removeEventListener('message', onMsg);
+        const f = $('#playerFrame'); if (f && f.contentWindow) f.contentWindow.postMessage({ type: 'lu-preview-end' }, PLAYER_ORIGIN);
+        attempt.endedAt = new Date().toISOString();
+      },
+    });
+  }
+
+  /* ---------- Edit material ---------- */
+  function materialModal(m, focusPackage = false) {
+    let newPkg = null;   // { report, file }
+    const ps = () => packageState({ ...m, type: $('#ed-type')?.value || m.type });
+    openModal({
+      title: 'Edit Material', wide: true,
+      body: `<form id="matForm" class="form-grid" novalidate>
+        <div class="field full"><label for="ed-title">Title <span class="req" aria-hidden="true">*</span></label><input class="input" id="ed-title" name="title" required aria-required="true" aria-describedby="${errId('ed-title')}" value="${esc(m.title)}" />${errSlot('ed-title')}</div>
+        <div class="field"><label for="ed-type">Material type</label><select class="select" id="ed-type" name="type">${Object.keys(TYPE).map((t) => `<option ${t === m.type ? 'selected' : ''}>${t}</option>`).join('')}</select></div>
+        <div class="field"><label for="ed-status">Status</label><select class="select" id="ed-status" name="status" aria-describedby="${errId('ed-status')}">${['Published', 'Draft'].map((s) => `<option ${s === m.status ? 'selected' : ''}>${s}</option>`).join('')}</select>${errSlot('ed-status')}</div>
+        ${audienceFields('ed', m.audience)}
+        <div class="field full" id="ed-scorm">
+          <span class="label" id="ed-pkg-label">SCORM package</span>
+          <div id="ed-pkg-current" class="muted" style="font-size:13px"></div>
+          <label class="btn btn-outline file-btn" for="ed-pkg">${icon('upload')}Replace package</label>
+          <input type="file" id="ed-pkg" class="sr-only" accept=".zip" aria-labelledby="ed-pkg-label" aria-describedby="ed-pkg-help ${errId('ed-pkg')}" />
+          <span class="hint" id="ed-pkg-help">SCORM 1.2 or 2004 .zip with imsmanifest.xml at the root.</span>
+          <div id="ed-pkg-report" role="status"></div>${errSlot('ed-pkg')}
+          <fieldset class="fieldset tracking-set"><legend>Tracking</legend>
+            ${switchRow('ed-track-completion', 'Track completion', 'Record completion and pass/fail reported by the module.', m.tracking ? m.tracking.trackCompletion : DB.scormSettings.trackCompletion)}
+            ${switchRow('ed-track-score', 'Track score', 'Sync the normalised score (0–100%) to the gradebook when the module reports one.', m.tracking ? m.tracking.syncScore : DB.scormSettings.syncScore)}
+          </fieldset>
+        </div></form>`,
       foot: `<button class="btn btn-outline" data-close>Cancel</button><button class="btn btn-primary" form="matForm" type="submit">${icon('check')}Save Changes</button>`,
-      onMount: (r) => ($('#matForm', r).onsubmit = (e) => {
-        e.preventDefault();
-        const d = Object.fromEntries(new FormData(e.target));
-        if (!d.title.trim()) return toast('Title is required', true);
-        Object.assign(m, d, { title: d.title.trim() });
-        closeModal(); render(); toast('Material updated');
-      }),
+      onMount: (r) => {
+        const aud = bindAudience(r, 'ed', m.audience);
+        const sync = () => {
+          $('#ed-scorm', r).hidden = $('#ed-type', r).value !== 'SCORM';
+          const s = ps();
+          $('#ed-pkg-current', r).innerHTML = newPkg ? '' : s ? `Current: <strong>${s.label}</strong>${m.package ? ` · ${esc(m.package.fileName)}${m.package.versionLabel ? ' · ' + esc(m.package.versionLabel) : ''}` : ''}` : '';
+        };
+        $('#ed-type', r).onchange = sync; sync();
+        $('#ed-pkg', r).onchange = async (e) => {
+          const f = e.target.files[0]; if (!f) return;
+          $('#ed-pkg-report', r).textContent = 'Validating package…';
+          const report = await Scorm.inspectPackage(await f.arrayBuffer());
+          newPkg = { report, file: f };
+          $('#ed-pkg-report', r).innerHTML = packageReportHtml(report, f);
+          setFieldError(r, 'ed-pkg', report.ok ? '' : 'Choose a valid SCORM package or keep the current one.');
+          sync();
+        };
+        if (focusPackage) { $('#ed-type', r).value = 'SCORM'; sync(); setTimeout(() => $('#ed-pkg', r).focus()); }
+        $('#matForm', r).onsubmit = async (e) => {
+          e.preventDefault();
+          const title = $('#ed-title', r).value.trim(), type = $('#ed-type', r).value, status = $('#ed-status', r).value;
+          const audience = aud.read();
+          const errs = Catalog.validateAudience(catalogCtx(), audience);
+          setFieldError(r, 'ed-title', title ? '' : 'Enter a title.');
+          let focusEl = aud.showErrors(errs) || (!title ? $('#ed-title', r) : null);
+          if (type === 'SCORM' && newPkg && !newPkg.report.ok) { setFieldError(r, 'ed-pkg', 'This package failed validation. Choose a corrected .zip or cancel.'); focusEl = focusEl || $('#ed-pkg', r); }
+          const draft = { ...m, type, package: type === 'SCORM' && newPkg?.report.ok ? { status: 'ready' } : m.package, audience };
+          const why = status === 'Published' && m.status !== 'Published' ? canPublish(draft) : '';
+          setFieldError(r, 'ed-status', why && !errs.length ? why : '');
+          if (why && !errs.length) focusEl = focusEl || $('#ed-status', r);
+          if (!title || errs.length || focusEl) { if (focusEl) focusEl.focus(); return; }
+          if (type === 'SCORM' && newPkg?.report.ok) {
+            const id = uid('pkg');
+            await Store.putPackage(id, newPkg.file);
+            if (m.package?.id) Store.deletePackage(m.package.id).catch(() => {});
+            m.package = packageMeta(newPkg.report, newPkg.file, id);
+          }
+          Object.assign(m, { title, type, status, audience });
+          if (type === 'SCORM') m.tracking = { trackCompletion: $('#ed-track-completion', r).checked, syncScore: $('#ed-track-score', r).checked };
+          closeModal(); render(); toast('Material updated');
+        };
+      },
     });
   }
 
   /* 6. Upload Material / SCORM */
+  const ACCEPT = {
+    SCORM: ['.zip', 'SCORM 1.2 or SCORM 2004 package (.zip) with imsmanifest.xml at the root · max 500 MB'],
+    PDF: ['.pdf', 'PDF document · max 50 MB'], Video: ['video/*', 'MP4, MOV, WEBM · max 2 GB'],
+    Document: ['.doc,.docx,.ppt,.pptx', 'Word or PowerPoint · max 50 MB'],
+  };
+  const defaultAudience = () => ({ schoolId: Catalog.SCHOOL.id, academicYearId: Catalog.yearIdFromLabel(DB.academicYear), classId: 'class-12', sectionIds: [], streamId: null, subjectId: Catalog.subjectIdFor('Physics') });
   function viewUpload() {
+    const a = defaultAudience();
+    const s = DB.scormSettings;
     return `<div class="crumbs">${crumb([['Content Library', 'content'], ['Upload Material']])}</div>
     ${pageHead('Upload SCORM Package', 'Upload interactive SCORM modules or other learning materials.', 'content')}
     <form class="split" id="uploadForm" novalidate>
       <div class="card card-pad">
         <div class="form-grid">
-          <div class="field full"><label>Title <span class="req">*</span></label><input class="input" name="title" value="Electric Charges – Interactive Module" required /></div>
-          <div class="field"><label>Class <span class="req">*</span></label><select class="select" name="cls">${classOpts('Class 12')}</select></div>
-          <div class="field"><label>Subject <span class="req">*</span></label><select class="select" name="subject">${subjOpts('Physics')}</select></div>
-          <div class="field full"><label>Material Type <span class="req">*</span></label>
-            <select class="select" name="type" id="mType"><option value="SCORM">SCORM (ZIP)</option><option value="PDF">PDF</option><option value="Video">Video</option><option value="Document">Document</option></select></div>
-          <div class="field full"><label>File <span class="req">*</span></label>
-            <label class="dropzone" id="drop"><input type="file" id="fileIn" hidden accept=".zip" />
-              <div class="tile-ico t-blue">${icon('cloudUp')}</div><strong>Drag & drop your file or click to browse</strong><small id="acceptHint">SCORM 1.2 / 2004 package (.zip) · max 500 MB</small></label>
-            <div id="fileBox"></div></div>
-          <div class="field full"><label>Description</label><textarea class="textarea" name="desc" placeholder="What will students learn?"></textarea></div>
+          <div class="field full"><label for="up-title">Title <span class="req" aria-hidden="true">*</span></label>
+            <input class="input" id="up-title" name="title" value="Electric Charges – Interactive Module" required aria-required="true" aria-describedby="${errId('up-title')}" />${errSlot('up-title')}</div>
+          ${audienceFields('up', a)}
+          <div class="field full"><label for="up-type">Material type <span class="req" aria-hidden="true">*</span></label>
+            <select class="select" id="up-type" name="type" aria-required="true"><option value="SCORM">SCORM (ZIP)</option><option value="PDF">PDF</option><option value="Video">Video</option><option value="Document">Document</option></select></div>
+          <div class="field full"><span class="label"><span id="up-file-label">File</span> <span class="req" aria-hidden="true">*</span></span>
+            <label class="dropzone" id="drop" for="up-file"><input type="file" id="up-file" class="sr-only" accept=".zip" aria-required="true" aria-labelledby="up-file-label" aria-describedby="up-file-hint ${errId('up-file')}" />
+              <div class="tile-ico t-blue">${icon('cloudUp')}</div><strong>Drag & drop your file or click to browse</strong><small id="up-file-hint">${ACCEPT.SCORM[1]}</small></label>
+            <div id="fileBox"></div><div id="pkgReport" role="status"></div>${errSlot('up-file')}</div>
+          <div class="field full"><label for="up-desc">Description</label><textarea class="textarea" id="up-desc" name="desc" placeholder="What will students learn?"></textarea></div>
         </div>
       </div>
       <div class="card card-pad">
-        <div class="card-head"><h3>Visibility</h3></div>
+        <fieldset class="fieldset" id="vis-set"><legend class="card-legend">Visibility</legend>
         <div class="radio-list" id="vis">
-          <label class="radio checked"><input type="radio" name="vis" value="Published" checked /><span><strong>Publish Now</strong><small>Visible to assigned students</small></span></label>
-          <label class="radio"><input type="radio" name="vis" value="Draft" /><span><strong>Save as Draft</strong><small>Not visible to students</small></span></label>
-          <label class="radio"><input type="radio" name="vis" value="Scheduled" /><span><strong>Schedule Publish</strong><small>Pick a date & time</small></span></label>
+          <label class="radio checked"><input type="radio" name="vis" value="Published" checked aria-describedby="vis-pub-help" /><span><strong>Publish Now</strong><small id="vis-pub-help">Visible to the selected class, sections and stream</small></span></label>
+          <label class="radio"><input type="radio" name="vis" value="Draft" aria-describedby="vis-draft-help" /><span><strong>Save as Draft</strong><small id="vis-draft-help">Staff only — not visible to students</small></span></label>
+          <label class="radio"><input type="radio" name="vis" value="Scheduled" aria-describedby="vis-sched-help" /><span><strong>Schedule Publish</strong><small id="vis-sched-help">Pick a date & time</small></span></label>
         </div>
-        <div class="schedule-box" id="schedBox"><div class="field"><label>Publish on</label><input class="input" type="datetime-local" name="when" value="2026-11-28T10:00" /></div></div>
-        <div class="card-head mt-20"><h3>Tracking</h3></div>
-        <div class="toggle-row"><div class="meta"><strong>Track completion</strong><small>Record SCORM completion status</small></div><label class="switch"><input type="checkbox" checked /><span></span></label></div>
-        <div class="toggle-row"><div class="meta"><strong>Track score</strong><small>Sync score to gradebook</small></div><label class="switch"><input type="checkbox" checked /><span></span></label></div>
+        <div class="schedule-box" id="schedBox"><div class="field"><label for="up-when">Publish on</label><input class="input" id="up-when" type="datetime-local" name="when" value="2026-11-28T10:00" /></div></div>
+        </fieldset>
+        <fieldset class="fieldset tracking-set mt-20" id="trackingSet"><legend class="card-legend">Tracking</legend>
+          ${switchRow('up-track-completion', 'Track completion', 'Record completion and pass/fail reported by the module (SCORM 1.2 and 2004).', s.trackCompletion, 'trackCompletion')}
+          ${switchRow('up-track-score', 'Track score', 'Sync the normalised score (0–100%) to the gradebook when the module reports one.', s.syncScore, 'syncScore')}
+        </fieldset>
         <div class="form-actions">
           <a class="btn btn-outline" href="#/content">Cancel</a>
           <button class="btn btn-primary" type="submit" id="uploadBtn">${icon('upload')}Upload</button>
@@ -640,21 +966,36 @@
     </form>`;
   }
   function bindUpload() {
-    let file = null;
-    const accept = { SCORM: ['.zip', 'SCORM 1.2 / 2004 package (.zip) · max 500 MB'], PDF: ['.pdf', 'PDF document · max 50 MB'], Video: ['video/*', 'MP4, MOV, WEBM · max 2 GB'], Document: ['.doc,.docx,.ppt,.pptx', 'Word or PowerPoint · max 50 MB'] };
-    const fileIn = $('#fileIn'), drop = $('#drop');
-    $('#mType').onchange = (e) => {
-      const [a, h] = accept[e.target.value]; fileIn.accept = a; $('#acceptHint').textContent = h;
-      $('.page-head h1').textContent = e.target.value === 'SCORM' ? 'Upload SCORM Package' : `Upload ${e.target.value}`;
+    const root = $('#uploadForm');
+    const aud = bindAudience(root, 'up', defaultAudience());
+    let file = null, report = null, validating = null;
+    const fileIn = $('#up-file'), drop = $('#drop'), type = () => $('#up-type').value;
+    $('#up-type').onchange = () => {
+      const [acc, hint] = ACCEPT[type()]; fileIn.accept = acc; $('#up-file-hint').textContent = hint;
+      $('.page-head h1').textContent = type() === 'SCORM' ? 'Upload SCORM Package' : `Upload ${type()}`;
+      $('#trackingSet').hidden = type() !== 'SCORM';
+      if (file) setFile(file);   // re-check the chosen file against the new type
     };
-    const setFile = (f) => {
-      file = f;
-      $('#fileBox').innerHTML = `<div class="file-row"><span class="tile-ico t-blue" style="width:38px;height:38px">${icon('package')}</span>
-        <div class="meta"><strong>${esc(f.name)}</strong><small>${(f.size / 1048576).toFixed(1)} MB</small><div class="progress"><i id="prog" style="width:0"></i></div></div>
-        <span id="fileOk"></span><button type="button" class="icon-btn" id="rmFile" aria-label="Remove file">${icon('x')}</button></div>`;
-      let p = 0; const t = setInterval(() => { p = Math.min(100, p + 12); const el = $('#prog'); if (!el) return clearInterval(t); el.style.width = p + '%'; if (p === 100) { clearInterval(t); $('#fileOk').innerHTML = icon('check', 'ok-ico'); } }, 80);
-      $('#rmFile').onclick = () => { file = null; fileIn.value = ''; $('#fileBox').innerHTML = ''; };
+    const validate = async (f) => {
+      $('#pkgReport').innerHTML = '<p class="muted" style="margin:10px 0 0">Validating package…</p>';
+      const r = await Scorm.inspectPackage(await f.arrayBuffer());
+      if (file !== f) return;
+      report = r;
+      $('#pkgReport').innerHTML = packageReportHtml(r, null);
+      setFieldError(root, 'up-file', r.ok ? '' : 'This package cannot be uploaded until the issues above are fixed.');
+      $('#fileOk').innerHTML = r.ok ? icon('check', 'ok-ico') : icon('alert', 'err-ico');
     };
+    function setFile(f) {
+      file = f; report = null;
+      setFieldError(root, 'up-file', '');
+      $('#pkgReport').innerHTML = '';
+      $('#fileBox').innerHTML = `<div class="file-row"><span class="tile-ico t-blue" style="width:38px;height:38px">${icon(type() === 'SCORM' ? 'package' : 'file')}</span>
+        <div class="meta"><strong>${esc(f.name)}</strong><small>${(f.size / 1048576).toFixed(1)} MB</small></div>
+        <span id="fileOk"></span><button type="button" class="icon-btn" id="rmFile" aria-label="Remove file ${esc(f.name)}">${icon('x')}</button></div>`;
+      $('#rmFile').onclick = () => { file = null; report = null; fileIn.value = ''; $('#fileBox').innerHTML = ''; $('#pkgReport').innerHTML = ''; setFieldError(root, 'up-file', ''); fileIn.focus(); };
+      if (type() === 'SCORM') validating = validate(f);
+      else { validating = null; $('#fileOk').innerHTML = icon('check', 'ok-ico'); }
+    }
     fileIn.onchange = () => fileIn.files[0] && setFile(fileIn.files[0]);
     ['dragenter', 'dragover'].forEach((ev) => drop.addEventListener(ev, (e) => { e.preventDefault(); drop.classList.add('drag'); }));
     ['dragleave', 'drop'].forEach((ev) => drop.addEventListener(ev, (e) => { e.preventDefault(); drop.classList.remove('drag'); }));
@@ -663,13 +1004,32 @@
       $$('#vis .radio').forEach((r) => r.classList.toggle('checked', r.querySelector('input').checked));
       $('#schedBox').classList.toggle('show', $('#vis input:checked').value === 'Scheduled');
     };
-    $('#uploadForm').onsubmit = (e) => {
+    root.onsubmit = async (e) => {
       e.preventDefault();
-      const d = Object.fromEntries(new FormData(e.target));
-      if (!d.title.trim()) return toast('Title is required', true);
-      if (!file) return toast('Please choose a file to upload', true);
-      DB.materials.unshift({ title: d.title.trim(), type: d.type, cls: d.cls, subject: d.subject, status: d.vis === 'Published' ? 'Published' : 'Draft' });
-      toast(d.vis === 'Scheduled' ? `Scheduled for ${d.when.replace('T', ' ')}` : `${d.title} uploaded`);
+      const title = $('#up-title').value.trim(), vis = $('#vis input:checked').value;
+      const audience = aud.read();
+      const errs = Catalog.validateAudience(catalogCtx(), audience);
+      setFieldError(root, 'up-title', title ? '' : 'Enter a title.');
+      let focusEl = !title ? $('#up-title') : null;
+      const audFocus = aud.showErrors(errs); focusEl = focusEl || audFocus;
+      if (!file) { setFieldError(root, 'up-file', 'Choose a file to upload.'); focusEl = focusEl || fileIn; }
+      else if (type() === 'SCORM') {
+        if (validating) await validating;
+        if (!report || !report.ok) { setFieldError(root, 'up-file', 'This package failed validation. Fix the issues listed above or choose another .zip.'); focusEl = focusEl || fileIn; }
+      }
+      if (focusEl) { focusEl.focus(); return toast('Please fix the highlighted fields', true); }
+      const m = { id: uid('mat'), title, type: type(), status: vis === 'Published' ? 'Published' : 'Draft', audience,
+        description: $('#up-desc').value.trim(), createdAt: new Date().toISOString() };
+      if (vis === 'Scheduled') m.publishAt = $('#up-when').value;
+      if (m.type === 'SCORM') {
+        const pid = uid('pkg');
+        try { await Store.putPackage(pid, file); } catch { return toast('Could not store the package file in this browser.', true); }
+        m.package = packageMeta(report, file, pid);
+        m.tracking = { trackCompletion: $('#up-track-completion').checked, syncScore: $('#up-track-score').checked };
+      }
+      DB.materials.unshift(m);
+      persist();
+      toast(vis === 'Scheduled' ? `Scheduled for ${m.publishAt.replace('T', ' ')}` : `${title} uploaded`);
       state.content.tab = 'All Materials'; go('content');
     };
   }
@@ -745,7 +1105,7 @@
     const top = [['Class 12 – A', 92], ['Class 12 – B', 88], ['Class 11 – A', 81], ['Class 11 – B', 77], ['Class 10 – A', 74]].map(([n, v]) => [n, Math.min(99, Math.round(j(v, 6)))]).sort((a, b) => b[1] - a[1]);
     const sel = (id, opts, v) => `<select class="select sm" id="${id}">${opts.map((o) => `<option ${o === v ? 'selected' : ''}>${o}</option>`).join('')}</select>`;
     return `${pageHead('Reports & Analytics', 'Track learning progress, scores and attendance.', 'dashboard',
-      `${sel('rCls', Array.from({ length: 7 }, (_, i) => `Class ${i + 6}`), r.cls)}${sel('rSub', DB.subjects, r.subject)}${sel('rRange', ['This Week', 'This Month', 'This Term'], r.range)}
+      `${sel('rCls', Catalog.CLASSES.map((c) => c.name), r.cls)}${sel('rSub', DB.subjects.map((x) => x.name), r.subject)}${sel('rRange', ['This Week', 'This Month', 'This Term'], r.range)}
        <button class="btn btn-outline" id="exportBtn">${icon('upload')}Export</button>`)}
     <div class="kpis">${kpi.map(([ic, n, l]) => `<div class="card kpi"><div class="kpi-img">${img(ic, '', l)}</div><div><div class="num">${n}</div><div class="lbl">${l}</div></div></div>`).join('')}</div>
     <div class="dash-grid">
@@ -853,11 +1213,10 @@
   const SETTING_TOGGLES = {
     roles: { title: 'Roles & Permissions', rows: [['Teachers can upload materials', 'Materials go to review before publishing', 1], ['Teachers can create quizzes', '', 1], ['Students can message teachers', '', 1], ['Students can download PDFs', '', 0]] },
     integrations: { title: 'Integrations', rows: [['Google SSO', 'Sign in with Google Workspace', 1], ['Microsoft SSO', 'Sign in with Microsoft 365', 0], ['Email (SMTP)', 'Send announcements by email', 1], ['SMS Gateway', 'Send urgent alerts by SMS', 0]] },
-    scorm: { title: 'SCORM Settings', rows: [['Track completion status', 'cmi.core.lesson_status', 1], ['Track score', 'Sync score to gradebook', 1], ['Allow re-attempts', 'Students can retake modules', 1], ['Open in new window', 'Launch player in a popup', 0]] },
     backup: { title: 'Backup & Maintenance', rows: [['Automatic daily backup', 'Runs every night at 2:00 AM', 1], ['Keep audit logs', 'Retain logs for 180 days', 1], ['Maintenance mode', 'Only admins can sign in', 0]] },
     exam: { title: 'Exam Settings', rows: [['Negative marking', 'Deduct 0.25 per wrong answer', 0], ['Shuffle questions', 'Randomize order per student', 1], ['Auto-submit on timeout', '', 1], ['Show results immediately', '', 0]] },
   };
-  const toggleRows = (rows) => rows.map(([t, s, on]) => `<div class="toggle-row"><div class="meta"><strong>${t}</strong>${s ? `<small>${s}</small>` : ''}</div><label class="switch"><input type="checkbox" ${on ? 'checked' : ''} /><span></span></label></div>`).join('');
+  const toggleRows = (rows, key) => rows.map(([t, s, on], i) => switchRow(`set-${key}-${i}`, t, s, on)).join('');
   function settingsModal(key) {
     if (key === 'general') {
       return openModal({ title: 'General Settings', body: `<form class="form-grid" id="genForm">
@@ -880,8 +1239,31 @@
         foot: '<button class="btn btn-primary" data-close>Done</button>',
         onMount: (r) => ($('#tagForm', r).onsubmit = (e) => { e.preventDefault(); const v = e.target.t.value.trim(); if (v) { $('#tagList', r).insertAdjacentHTML('beforeend', `<span class="chip">${esc(v)}</span>`); e.target.reset(); } }) });
     }
+    if (key === 'scorm') {
+      // Version-neutral labels; persisted defaults for new SCORM uploads. Mapping: docs/scorm-tracking.md
+      const s = DB.scormSettings;
+      return openModal({ title: 'SCORM Settings', wide: true,
+        body: `<fieldset class="fieldset"><legend class="sr-only">SCORM tracking defaults</legend>
+          ${switchRow('scorm-track-completion', 'Track completion', 'Record completion and pass/fail for SCORM 1.2 and SCORM 2004 modules.', s.trackCompletion)}
+          ${switchRow('scorm-sync-score', 'Sync score to gradebook', 'Send the normalised score (0–100%) when the module reports one. No score is never recorded as 0.', s.syncScore)}
+          ${switchRow('scorm-reattempts', 'Allow re-attempts', 'Students can retake modules', s.allowReattempts)}
+          ${switchRow('scorm-new-window', 'Open in new window', 'Launch player in a popup', s.openInNewWindow)}</fieldset>
+          <details class="mapping"><summary>How these settings map to SCORM 1.2 and SCORM 2004</summary>
+            <table class="tbl"><thead><tr><th>Setting</th><th>SCORM 1.2</th><th>SCORM 2004</th></tr></thead><tbody>
+              <tr><td>Track completion</td><td><code>cmi.core.lesson_status</code> (passed / completed / failed → completed; incomplete / browsed → incomplete)</td><td><code>cmi.completion_status</code></td></tr>
+              <tr><td>Pass / fail</td><td><code>cmi.core.lesson_status</code> (passed / failed)</td><td><code>cmi.success_status</code> (kept separate from completion)</td></tr>
+              <tr><td>Sync score</td><td><code>cmi.core.score.raw</code> scaled by <code>score.min</code> / <code>score.max</code></td><td><code>cmi.score.scaled</code> × 100, else <code>cmi.score.raw</code> with <code>min</code> / <code>max</code></td></tr>
+            </tbody></table>
+            <p class="muted" style="font-size:12.5px">Missing values are stored as “unknown” / “no score” — never as 0% or complete.</p></details>`,
+        foot: `<button class="btn btn-outline" data-close>Cancel</button><button class="btn btn-primary" id="saveT">Save</button>`,
+        onMount: (r) => ($('#saveT', r).onclick = () => {
+          DB.scormSettings = { trackCompletion: $('#scorm-track-completion', r).checked, syncScore: $('#scorm-sync-score', r).checked,
+            allowReattempts: $('#scorm-reattempts', r).checked, openInNewWindow: $('#scorm-new-window', r).checked };
+          persist(); closeModal(); toast('SCORM Settings saved');
+        }) });
+    }
     const cfg = SETTING_TOGGLES[key];
-    openModal({ title: cfg.title, body: toggleRows(cfg.rows),
+    openModal({ title: cfg.title, body: toggleRows(cfg.rows, key),
       foot: `<button class="btn btn-outline" data-close>Cancel</button><button class="btn btn-primary" id="saveT">Save</button>`,
       onMount: (r) => ($('#saveT', r).onclick = () => {
         $$('input[type=checkbox]', r).forEach((c, i) => (cfg.rows[i][2] = c.checked ? 1 : 0));
@@ -911,7 +1293,7 @@
     communication: [viewCommunication, bindCommunication, 'Communication'],
     settings: [viewSettings, bindSettings, 'System Settings'],
   };
-  const currentRoute = () => { const r = location.hash.replace(/^#\/?/, ''); return ROUTES[r] ? r : 'dashboard'; };
+  const currentRoute = () => { const r = location.hash.replace(/^#\/?/, '').split('?')[0]; return ROUTES[r] ? r : 'dashboard'; };
 
   let lastRoute = null;
   function render() {
@@ -927,6 +1309,7 @@
     window.scrollTo(0, scroll);
     lastRoute = r;
     closeMenu();
+    persist();
   }
   window.addEventListener('hashchange', render);
 

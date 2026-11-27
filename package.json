@@ -1,0 +1,11 @@
+{
+  "name": "learning-universe-admin",
+  "private": true,
+  "description": "Learning Universe LMS Admin Portal (static site, no build step)",
+  "scripts": {
+    "lint": "node scripts/check-syntax.mjs",
+    "test": "node --test \"tests/unit/*.test.mjs\"",
+    "test:e2e": "node --test --test-concurrency=1 \"tests/e2e/*.e2e.mjs\"",
+    "qa:packages": "node tests/fixtures/packages.mjs"
+  }
+}
