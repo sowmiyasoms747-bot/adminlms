@@ -104,6 +104,14 @@ input.img-check:checked {
 .brand-text small { color: #8fa6d4; font-size: 12px; }
 
 .nav { padding: 14px 12px; display: flex; flex-direction: column; gap: 3px; flex: 1; overflow-y: auto; }
+
+/* Sidebar scrollbar — themed to the navy admin palette */
+.nav { scrollbar-width: thin; scrollbar-color: rgba(43,120,246,.55) transparent; }
+.nav::-webkit-scrollbar { width: 6px; }
+.nav::-webkit-scrollbar-track { background: transparent; }
+.nav::-webkit-scrollbar-button { display: none; height: 0; }
+.nav::-webkit-scrollbar-thumb { background: rgba(43,120,246,.45); border-radius: 999px; }
+.nav::-webkit-scrollbar-thumb:hover { background: var(--blue-500); }
 .nav-label { font-size: 10.5px; letter-spacing: 1.1px; text-transform: uppercase; color: #6f86b5; padding: 12px 12px 6px; font-weight: 600; }
 .nav a {
   display: flex; align-items: center; gap: 12px; padding: 10px 12px; border-radius: 10px;
