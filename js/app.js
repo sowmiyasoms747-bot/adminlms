@@ -367,10 +367,9 @@
     { key: 'subjects', ic: 'book', img: 'acSubjects', c: 't-orange', t: 'Subjects', s: '(Physics, Chemistry…)', count: () => DB.subjects.length },
     { key: 'sections', ic: 'sitemap', img: 'acSections', c: 't-blue', t: 'Sections', s: '(A, B, C…)', count: () => DB.sections.length },
     { key: 'syllabus', ic: 'syllabus', img: 'acSyllabus', c: 't-blue', t: 'Syllabus', s: '(Chapter & Units)' },
-    { key: 'timetable', ic: 'timetable', c: 't-purple', t: 'Timetable', s: '(Class & Teacher)' },
   ];
   function viewAcademic() {
-    return `${pageHead('Academic Setup', 'Configure academic year, classes, subjects, sections, syllabus and timetable.', 'dashboard',
+    return `${pageHead('Academic Setup', 'Configure academic year, classes, subjects, sections and syllabus.', 'dashboard',
       `<a class="btn btn-primary" href="#/academic/create-class">${icon('plus')}Create Class</a>`)}
     <div class="feature-grid">${ACADEMIC.map((a) => `
       <div class="card feature" data-ac="${a.key}" tabindex="0" role="button">
@@ -412,12 +411,6 @@
       openModal({ title: 'Syllabus — Class 12 Physics', body: `<div style="display:flex;gap:10px;margin-bottom:12px"><select class="select">${classOpts('Class 12')}</select><select class="select">${subjOpts('Physics')}</select></div>` +
         list(units.map((u, i) => `<span class="tile-ico t-blue" style="width:34px;height:34px;font-weight:800">${i + 1}</span><div class="meta"><strong>Unit ${i + 1}: ${u}</strong><small>${3 + (i % 3)} chapters · ${8 + i * 2} materials</small></div>${statusPill(i < 3 ? 'Published' : 'Draft')}`)),
         foot: '<button class="btn btn-outline" data-close>Close</button><button class="btn btn-primary" data-close>Save Syllabus</button>', wide: true });
-    } else if (k === 'timetable') {
-      const days = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri'], periods = ['9:00', '10:00', '11:15', '12:15', '2:00'];
-      const sub = ['Physics', 'Chemistry', 'Mathematics', 'English', 'Biology', 'Computer Sci.'];
-      const tbl = `<div class="table-wrap"><table class="tbl"><thead><tr><th>Time</th>${days.map((d) => `<th>${d}</th>`).join('')}</tr></thead><tbody>
-        ${periods.map((p, i) => `<tr><td><strong>${p}</strong></td>${days.map((_, j) => `<td>${sub[(i + j * 2) % sub.length]}</td>`).join('')}</tr>`).join('')}</tbody></table></div>`;
-      openModal({ title: 'Timetable — Class 12 A', body: tbl, wide: true, foot: '<button class="btn btn-outline" data-close>Close</button><button class="btn btn-primary" data-close>Publish Timetable</button>' });
     }
   }
 
